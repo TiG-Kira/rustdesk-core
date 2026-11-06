@@ -19,7 +19,7 @@ use std::str::FromStr;
 use std::sync::RwLock;
 
 use hbb_common::{config, log};
-use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::{JNIEnv, JavaVM};
 
@@ -28,6 +28,11 @@ use crate::flutter_ffi::{self, SessionID};
 /// Kotlin 侧 `RustDeskCore.onEvent(sessionId, kind, payload)` 的回调对象。
 /// 由 `nativeInit` 注册，`nativeShutdown` 释放。
 static EVENT_SINK: RwLock<Option<EventSink>> = RwLock::new(None);
+
+thread_local! {
+    /// 帧拷贝中转缓冲：按需扩容后复用，避免每帧重新分配几 MB 的 Vec。
+    static FRAME_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+}
 
 struct EventSink {
     vm: JavaVM,
@@ -312,25 +317,60 @@ pub unsafe extern "system" fn Java_com_termux_app_rustdesk_RustDeskCore_nativeGe
     }
 }
 
-/// 帧缓冲：返回 Rust 侧 RGBA 裸指针，复用上游已导出的 C ABI `session_get_rgba`
-/// （它内部已处理 `display_rgbas` 锁与 valid 判定，避免在此重复 trait 调用）。
-/// Kotlin 须在 `Rgba` 事件回调内同步拷贝，不得跨线程持有该指针。
+/// 帧像素尺寸：高 32 位为宽、低 32 位为高，`0` 表示当前没有可用帧。
 #[no_mangle]
-pub unsafe extern "system" fn Java_com_termux_app_rustdesk_RustDeskCore_nativeGetRgba(
+pub unsafe extern "system" fn Java_com_termux_app_rustdesk_RustDeskCore_nativeGetRgbaDims(
     mut env: JNIEnv,
     _class: JClass,
     session_id: JString,
     display: jint,
 ) -> jlong {
-    let sid_str = jstring_to_string(&mut env, &session_id);
-    // C ABI 参数是 *const c_char，需 NUL 结尾；仅用于查表，不跨线程保存。
-    let c_sid = match std::ffi::CString::new(sid_str) {
-        Ok(v) => v,
-        Err(_) => return 0,
+    match parse_sid(&jstring_to_string(&mut env, &session_id)) {
+        Some(sid) => {
+            let (w, h) = crate::flutter::session_get_rgba_dims(sid, display as usize);
+            ((w as jlong) << 32) | (h as jlong)
+        }
+        None => 0,
+    }
+}
+
+/// 把当前帧整段拷进调用方复用的字节数组（长度取 `nativeGetRgbaSize` 的结果），
+/// 返回实际写入的字节数，`0` 表示没有有效帧。
+/// 拷贝在 Rust 侧持读锁完成，Kotlin 不必也不得拿到裸指针。
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_termux_app_rustdesk_RustDeskCore_nativeCopyRgba(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: JString,
+    display: jint,
+    dst: JByteArray,
+) -> jint {
+    let sid = match parse_sid(&jstring_to_string(&mut env, &session_id)) {
+        Some(v) => v,
+        None => return 0,
     };
-    // 上游签名写的是 Rust `char` 而非 `c_char`，内部 `c as _` 又转回 `*const c_char`，
-    // 故此处的指针类型转换只是绕过签名书写差异，语义仍是 NUL 结尾的字节串。
-    crate::flutter::session_get_rgba(c_sid.as_ptr() as *const char, display as usize) as jlong
+    let display = display as usize;
+    let len = crate::flutter::session_get_rgba_size(sid, display);
+    if len == 0 {
+        return 0;
+    }
+    FRAME_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        let n = crate::flutter::session_copy_rgba(sid, display, &mut buf[..]);
+        if n == 0 {
+            return 0;
+        }
+        // jbyte 即 i8，与 u8 同宽同布局，仅按 Java 侧类型重新解释
+        let bytes = std::slice::from_raw_parts(buf.as_ptr() as *const i8, n);
+        if let Err(err) = env.set_byte_array_region(&dst, 0, bytes) {
+            log::error!("nativeCopyRgba: set_byte_array_region failed: {:?}", err);
+            return 0;
+        }
+        n as jint
+    })
 }
 
 #[no_mangle]

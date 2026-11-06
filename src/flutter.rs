@@ -278,6 +278,9 @@ struct RgbaData {
     // We must check the `rgba_valid` before reading [rgba].
     data: Vec<u8>,
     valid: bool,
+    // 帧像素尺寸：`data` 是紧密排列的 RGBA，自研 UI 需要宽高才能建位图。
+    w: usize,
+    h: usize,
 }
 
 pub type FlutterRgbaRendererPluginOnRgba = unsafe extern "C" fn(
@@ -1224,6 +1227,8 @@ impl FlutterHandler {
         // If the current rgba is not fetched by flutter, i.e., is valid.
         // We give up sending a new event to flutter.
         let mut rgba_write_lock = self.display_rgbas.write().unwrap();
+        // `raw` 会被换出，像素尺寸要提前取
+        let (frame_w, frame_h) = (rgba.w, rgba.h);
         if let Some(rgba_data) = rgba_write_lock.get_mut(&display) {
             if rgba_data.valid {
                 return;
@@ -1232,10 +1237,14 @@ impl FlutterHandler {
             }
             // Return the rgba buffer to the video handler for reusing allocated rgba buffer.
             std::mem::swap::<Vec<u8>>(&mut rgba.raw, &mut rgba_data.data);
+            rgba_data.w = frame_w;
+            rgba_data.h = frame_h;
         } else {
             let mut rgba_data = RgbaData::default();
             std::mem::swap::<Vec<u8>>(&mut rgba.raw, &mut rgba_data.data);
             rgba_data.valid = true;
+            rgba_data.w = frame_w;
+            rgba_data.h = frame_h;
             rgba_write_lock.insert(display, rgba_data);
         }
         drop(rgba_write_lock);
@@ -1795,6 +1804,33 @@ pub fn session_get_rgba_size(session_id: SessionID, display: usize) -> usize {
             .unwrap()
             .get(&display)
             .map_or(0, |rgba| rgba.data.len());
+    }
+    0
+}
+
+/// JNI 桥：当前帧的原始像素宽高；无帧时返回 `(0, 0)`。
+pub fn session_get_rgba_dims(session_id: SessionID, display: usize) -> (usize, usize) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        if let Some(rgba_data) = session.display_rgbas.read().unwrap().get(&display) {
+            return (rgba_data.w, rgba_data.h);
+        }
+    }
+    (0, 0)
+}
+
+/// JNI 桥：在读锁内把当前帧拷进 `dst`，返回拷贝的字节数（0 = 无有效帧）。
+///
+/// 不复用 `session_get_rgba` + `session_get_rgba_size` 的组合：那两次调用之间缓冲可能被
+/// 渲染线程换走，长度与指针会失配；这里整段持锁，拷贝期间缓冲不会被替换。
+pub fn session_copy_rgba(session_id: SessionID, display: usize, dst: &mut [u8]) -> usize {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        if let Some(rgba_data) = session.display_rgbas.read().unwrap().get(&display) {
+            if rgba_data.valid {
+                let n = rgba_data.data.len().min(dst.len());
+                dst[..n].copy_from_slice(&rgba_data.data[..n]);
+                return n;
+            }
+        }
     }
     0
 }
