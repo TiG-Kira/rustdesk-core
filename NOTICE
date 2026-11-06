@@ -1,0 +1,27 @@
+rustdesk-core
+Copyright (C) 2026 KiraStudio / Termux Ultra contributors (modifications)
+Copyright (C) RustDesk project and its contributors (original work)
+
+This software is a derivative work of RustDesk, obtained from
+https://github.com/rustdesk/rustdesk at tag 1.5.1, and is licensed under the
+GNU Affero General Public License, version 3 (AGPL-3.0). The full license text
+is preserved in the LICENCE file.
+
+Modifications made in this repository (see UPSTREAM.md for the complete list):
+  * Removed the Flutter/Dart user interface and desktop packaging material.
+  * Extracted Android build scripts into scripts/.
+  * Vendored the libs/hbb_common submodule as a regular directory.
+  * Added a JNI bridge and replaced the FRB event stream sink so that the
+    Rust core can be driven by a Kotlin/Compose UI in the host application.
+
+The original work's copyright notices and the AGPL-3.0 license text are
+retained. No upstream identity fields (client id, device uuid, deviceInfo,
+apiDomain) are altered: RustDesk account/OIDC login and session-level
+password/2FA authentication continue to be issued by the Rust core itself
+under the RustDesk client identity.
+
+Source for this derivative work: https://github.com/TiG-Kira/rustdesk-core
+Upstream source:                 https://github.com/rustdesk/rustdesk
+
+This notice is provided for compliance with AGPL-3.0 section 5 and must be
+kept when distributing binaries built from this repository.

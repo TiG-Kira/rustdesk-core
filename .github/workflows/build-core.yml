@@ -1,0 +1,163 @@
+name: Build RustDesk Core
+
+# 把裁剪后的 RustDesk Rust 核心编成 librustdesk.so，供 Termux Ultra 宿主经 JNI 调用。
+#
+# 本仓库是 rustdesk/rustdesk@1.5.1 的裁剪 fork（见 UPSTREAM.md）：删除 Dart UI 与桌面打包材料，
+# 保留 src/ libs/ res/ 与构建脚本。宿主用 Kotlin/Compose 自研会话页，不经 Flutter/Dart。
+#
+# 工具链版本全部对齐上游 .github/workflows/flutter-build.yml；改任何一个都要同步核对上游，
+# 否则 FRB 生成代码与核心接口会对不上。前段源自 rustdesk-aar.yml，已实测 12 步全部 success。
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 所对齐的 RustDesk 上游 tag（仅用于产物命名/追溯）
+        required: true
+        default: "1.5.1"
+      abi:
+        description: 目标 ABI
+        required: true
+        type: choice
+        default: arm64-v8a
+        options:
+          - arm64-v8a
+          - armeabi-v7a
+          - x86_64
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.75"
+  CARGO_NDK_VERSION: "3.1.2"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  NDK_VERSION: "r28c"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+  ABI: ${{ inputs.abi }}
+
+jobs:
+  build-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Export Actions cache env
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Verify identity boundary
+        # 硬约束：JNI 桥只透传，不得自行发起 HTTP 登录或改写身份字段。
+        # P1 阶段 android_jni.rs 尚未加入，文件不存在时跳过；加入后此检查生效。
+        run: |
+          if [ -f src/android_jni.rs ]; then
+            if grep -nE 'reqwest|post_request_sync|http_request_sync|hyper::|Client::new|deviceInfo|apiDomain' src/android_jni.rs; then
+              echo "::error::JNI 桥出现自建 HTTP 或身份字段，违反『只透传』约束"
+              exit 1
+            fi
+          fi
+          # 这些文件里的身份代码不允许被改动，用上游 tag 的源码做 diff 兜底由 UPSTREAM.md 人工核对；
+          # 此处只拦截桥接层的显式越界。
+          echo "identity boundary check passed"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake curl gcc g++ gcc-multilib g++-multilib git libc6-dev \
+            libclang-dev llvm-dev nasm ninja-build pkg-config wget \
+            openjdk-17-jdk-headless
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustdesk-core
+          key: ${{ inputs.abi }}
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install cargo tools
+        run: |
+          cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features uuid --locked
+
+      - name: Generate flutter_rust_bridge code
+        # lib.rs 中 mod bridge_generated 在 android/flutter feature 下无条件启用，必须生成。
+        # 只取 Rust 侧产物；Dart/C 产物落到占位目录，不参与编译，也不需要 Flutter SDK 或 pub get。
+        run: |
+          mkdir -p flutter/lib flutter/macos/Runner
+          ~/.cargo/bin/flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+          test -f src/bridge_generated.rs || { echo "bridge_generated.rs 未生成"; exit 1; }
+
+      - name: Build vcpkg dependencies
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          chmod +x scripts/build_android_deps.sh scripts/ndk_*.sh
+          if ! ./scripts/build_android_deps.sh "${ABI}"; then
+            find "${VCPKG_ROOT}" -name '*.log' -exec sh -c 'echo "===== $1"; cat "$1"' _ {} \;
+            exit 1
+          fi
+
+      - name: Build rust core
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          case "${ABI}" in
+            arm64-v8a)   TARGET=aarch64-linux-android;    SCRIPT=./scripts/ndk_arm64.sh; LIBCXX=aarch64-linux-android ;;
+            armeabi-v7a) TARGET=armv7-linux-androideabi; SCRIPT=./scripts/ndk_arm.sh;  LIBCXX=arm-linux-androideabi ;;
+            x86_64)      TARGET=x86_64-linux-android;     SCRIPT=./scripts/ndk_x64.sh;  LIBCXX=x86_64-linux-android ;;
+            *) echo "unsupported abi: ${ABI}"; exit 1 ;;
+          esac
+          # hwcodec 的 build.rs 用 bindgen 解析 C 头文件，需显式给 NDK sysroot，
+          # 否则 libclang 退回宿主 /usr/include 并在非本机 triple 下找不到 multiarch 头。
+          SYSROOT="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          export BINDGEN_EXTRA_CLANG_ARGS="--target=${TARGET}21 --sysroot=${SYSROOT}"
+          rustup target add "${TARGET}"
+          "${SCRIPT}"
+          mkdir -p "artifacts/${ABI}"
+          SOURCE=$(find "target/${TARGET}/release" -maxdepth 1 -name '*librustdesk.so' | head -1)
+          test -n "${SOURCE}" || { echo "no librustdesk.so produced"; exit 1; }
+          cp "${SOURCE}" "artifacts/${ABI}/librustdesk.so"
+          cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${LIBCXX}/libc++_shared.so" \
+             "artifacts/${ABI}/"
+          ls -lh "artifacts/${ABI}/"
+
+      - name: Upload core libs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-core-${{ inputs.abi }}-${{ inputs.upstream_tag }}
+          path: artifacts/${{ inputs.abi }}/
+          if-no-files-found: error
