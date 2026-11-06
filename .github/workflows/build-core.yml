@@ -60,8 +60,10 @@ jobs:
         # P1 阶段 android_jni.rs 尚未加入，文件不存在时跳过；加入后此检查生效。
         run: |
           if [ -f src/android_jni.rs ]; then
-            if grep -nE 'reqwest|post_request_sync|http_request_sync|hyper::|Client::new|deviceInfo|apiDomain' src/android_jni.rs; then
-              echo "::error::JNI 桥出现自建 HTTP 或身份字段，违反『只透传』约束"
+            # 只检查代码行，排除 // 文档注释（约束说明里会提到这些字段名）。
+            if grep -vE '^\s*(//|//!|///|\*|/\*)' src/android_jni.rs \
+               | grep -nE 'reqwest|post_request_sync|http_request_sync|hyper::|Client::new|deviceInfo|apiDomain|\.get_id\(|\.get_uuid\('; then
+              echo "::error::JNI 桥出现自建 HTTP 或身份字段读写，违反『只透传』约束"
               exit 1
             fi
           fi

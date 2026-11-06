@@ -62,7 +62,14 @@ src/lib.rs   删除 `#[cfg(...)] mod bridge_generated;`
 故一并删掉 codegen 步骤、Flutter SDK 依赖与 `flutter/` 占位目录。
 `StreamSink` / `SyncReturn` 类型仍由 `flutter_rust_bridge` crate 提供，`flutter` feature 保留。
 
-## 后续计划改动（尚未实施，P1 基线先验证纯裁剪可编）
+**连带修改（run `42281757405` 实测暴露）**：`EventToUI` 是自定义 enum，其
+`IntoIntoDart` 实现正是由 codegen 生成的。删掉生成物后，`flutter.rs` 里 6 处
+`stream.add(EventToUI::...)` 失去 trait bound 而无法编译。Android target 下事件出口本就
+改走 JNI 旁路，故这 6 处 `.add()` 用 `#[cfg(not(target_os = "android"))]` 消去；
+类型定义与 FRB 导出签名均不动，非 Android 平台行为完全不变。
+`StreamSink<String>` 的 `.add(...)` 不受影响（String 的实现由 FRB crate 自带）。
+
+## 后续计划改动（本地已写好，待 P1 基线 CI 通过后提交验证）
 
 采用 **JNI 旁路**方案，**不改任何 FRB 类型与导出签名**（早期设想的 `UiSink` 枚举会改动
 `session_start` / `start_global_event_stream` 的参数类型，触发 FRB codegen 解析，冲突面大，已弃用）：

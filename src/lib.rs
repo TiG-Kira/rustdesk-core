@@ -40,6 +40,8 @@ pub use version::*;
 // flutter_rust_bridge crate 提供（flutter feature 保留）。
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 pub mod flutter;
+#[cfg(target_os = "android")]
+pub mod android_jni;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 pub mod flutter_ffi;
 use common::*;

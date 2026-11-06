@@ -614,9 +614,15 @@ impl FlutterHandler {
                 }
             }
             if push {
+                // Android 下事件走 JNI 旁路；FRB 的 .add 需要 codegen 生成的
+                // IntoIntoDart 实现，本仓库已移除 codegen，故在 Android 下消去。
+                #[cfg(not(target_os = "android"))]
                 if let Some(stream) = &session.event_stream {
                     stream.add(EventToUI::Event(out.clone()));
                 }
+                // JNI 旁路：自研 UI 不经 Dart，把同一份 JSON 转发给 Kotlin。
+                #[cfg(target_os = "android")]
+                crate::android_jni::emit_event(&sid.to_string(), "event", &out);
             }
         }
     }
@@ -673,19 +679,25 @@ impl FlutterHandler {
 impl InvokeUiSession for FlutterHandler {
     // On the event stream, so that it keeps its order with the cursor_id events around it.
     fn set_cursor_data(&self, cd: CursorData) {
-        let colors = cd.colors.to_vec();
-        for session in self.session_handlers.read().unwrap().values() {
-            if let Some(stream) = &session.event_stream {
-                stream.add(EventToUI::Cursor {
-                    id: cd.id.to_string(),
-                    hotx: cd.hotx,
-                    hoty: cd.hoty,
-                    width: cd.width,
-                    height: cd.height,
-                    colors: colors.clone(),
-                });
+        // 自研 UI 暂用系统光标，Android 下不转发自定义光标位图（避免依赖 codegen 胶水）。
+        #[cfg(not(target_os = "android"))]
+        {
+            let colors = cd.colors.to_vec();
+            for session in self.session_handlers.read().unwrap().values() {
+                if let Some(stream) = &session.event_stream {
+                    stream.add(EventToUI::Cursor {
+                        id: cd.id.to_string(),
+                        hotx: cd.hotx,
+                        hoty: cd.hoty,
+                        width: cd.width,
+                        height: cd.height,
+                        colors: colors.clone(),
+                    });
+                }
             }
         }
+        #[cfg(target_os = "android")]
+        let _ = cd;
     }
 
     fn set_cursor_id(&self, id: String) {
@@ -890,6 +902,7 @@ impl InvokeUiSession for FlutterHandler {
         }
         for (_, session) in self.session_handlers.read().unwrap().iter() {
             if session.renderer.on_texture(display, texture) {
+                #[cfg(not(target_os = "android"))]
                 if let Some(stream) = &session.event_stream {
                     stream.add(EventToUI::Texture(display, true));
                 }
@@ -1229,7 +1242,13 @@ impl FlutterHandler {
 
         let mut is_sent = false;
         let is_multi_sessions = self.is_multi_ui_session();
-        for h in self.session_handlers.read().unwrap().values() {
+        // JNI 旁路：自研 UI 没有 FRB stream，但帧已被 Kotlin 侧消费，必须计入 is_sent，
+        // 否则下面的 !is_sent 分支会把 rgba_data.valid 复位、帧立刻失效。
+        #[cfg(target_os = "android")]
+        let jni_active = crate::android_jni::jni_sink_active();
+        #[cfg(not(target_os = "android"))]
+        let jni_active = false;
+        for (sid, h) in self.session_handlers.read().unwrap().iter() {
             // The soft renderer does not support multi-displays session for now.
             if h.displays.len() > 1 {
                 continue;
@@ -1240,11 +1259,18 @@ impl FlutterHandler {
                     continue;
                 }
             }
+            #[cfg(not(target_os = "android"))]
             if let Some(stream) = &h.event_stream {
                 stream.add(EventToUI::Rgba(display));
                 is_sent = true;
             }
+            #[cfg(target_os = "android")]
+            if jni_active {
+                crate::android_jni::emit_event(&sid.to_string(), "rgba", &display.to_string());
+                is_sent = true;
+            }
         }
+        let _ = jni_active;
         // We need `is_sent` here. Because we use texture render for multi-displays session.
         //
         // Eg. We have two windows, one is display 1, the other is displays 0&1.
@@ -1270,6 +1296,7 @@ impl FlutterHandler {
         for (_, session) in self.session_handlers.read().unwrap().iter() {
             if use_texture_render || session.displays.len() > 1 {
                 if session.renderer.on_rgba(display, rgba) {
+                    #[cfg(not(target_os = "android"))]
                     if let Some(stream) = &session.event_stream {
                         stream.add(EventToUI::Texture(display, false));
                     }
@@ -1437,11 +1464,50 @@ pub fn session_start_(
     }
 }
 
+/// JNI 侧启动会话：等价于 `session_start_` 的连接启动分支，但不构造 FRB `StreamSink`。
+/// 自研 UI 不经 Dart，`event_stream` 保持 None，事件全部由 `android_jni::emit_event` 旁路转发。
+/// 仅 Android 编译；其它平台不存在此符号（调用点在 JNI 桥内，也被 cfg 门控）。
+#[cfg(target_os = "android")]
+pub fn session_start_jni(session_id: &SessionID, id: &str) -> ResultType<()> {
+    let mut is_found = false;
+    for s in sessions::get_sessions() {
+        if s.session_handlers.read().unwrap().contains_key(session_id) {
+            is_found = true;
+            break;
+        }
+    }
+    if !is_found {
+        bail!(
+            "No session with peer id {}, session id: {}",
+            id,
+            session_id.to_string()
+        );
+    }
+
+    if let Some(session) = sessions::get_session_by_session_id(session_id) {
+        let is_first_ui_session = session.session_handlers.read().unwrap().len() == 1;
+        if is_first_ui_session {
+            log::info!("Session {} start (JNI UI)", id);
+            let session = (*session).clone();
+            std::thread::spawn(move || {
+                let round = session.connection_round_state.lock().unwrap().new_round();
+                io_loop(session, round);
+            });
+        }
+        Ok(())
+    } else {
+        bail!("No session with peer id {}", id)
+    }
+}
+
 #[inline]
 fn try_send_close_event(event_stream: &Option<StreamSink<EventToUI>>) {
+    #[cfg(not(target_os = "android"))]
     if let Some(stream) = &event_stream {
         stream.add(EventToUI::Event("close".to_owned()));
     }
+    #[cfg(target_os = "android")]
+    let _ = event_stream;
 }
 
 #[cfg(not(target_os = "ios"))]
@@ -1851,6 +1917,9 @@ pub fn push_session_event(session_id: &SessionID, name: &str, event: Vec<(&str, 
 
 #[inline]
 pub fn push_global_event(channel: &str, event: String) -> Option<bool> {
+    // JNI 旁路：全局事件（连接状态、账号登录结果等）同样转一份给自研 UI。
+    #[cfg(target_os = "android")]
+    crate::android_jni::emit_event(channel, "global", &event);
     Some(GLOBAL_EVENT_STREAM.read().unwrap().get(channel)?.add(event))
 }
 
