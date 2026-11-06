@@ -20,7 +20,7 @@ use std::sync::RwLock;
 
 use hbb_common::{config, log};
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jint, jlong};
+use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::{JNIEnv, JavaVM};
 
 use crate::flutter_ffi::{self, SessionID};
@@ -328,7 +328,9 @@ pub unsafe extern "system" fn Java_com_termux_app_rustdesk_RustDeskCore_nativeGe
         Ok(v) => v,
         Err(_) => return 0,
     };
-    crate::flutter::session_get_rgba(c_sid.as_ptr(), display as usize) as jlong
+    // 上游签名写的是 Rust `char` 而非 `c_char`，内部 `c as _` 又转回 `*const c_char`，
+    // 故此处的指针类型转换只是绕过签名书写差异，语义仍是 NUL 结尾的字节串。
+    crate::flutter::session_get_rgba(c_sid.as_ptr() as *const char, display as usize) as jlong
 }
 
 #[no_mangle]
