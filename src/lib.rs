@@ -35,8 +35,9 @@ pub(crate) mod update_hash;
 mod manual_update;
 mod version;
 pub use version::*;
-#[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
-mod bridge_generated;
+// FRB 生成的 Dart 侧胶水（bridge_generated.rs）不参与 Rust 逻辑，本仓库自研 JNI UI、
+// 不需要 Dart，故移除该模块与 codegen 步骤。StreamSink/SyncReturn 类型仍由
+// flutter_rust_bridge crate 提供（flutter feature 保留）。
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 pub mod flutter;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]

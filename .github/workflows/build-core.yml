@@ -32,7 +32,6 @@ env:
   RUST_VERSION: "1.75"
   CARGO_NDK_VERSION: "3.1.2"
   CARGO_EXPAND_VERSION: "1.0.95"
-  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
   NDK_VERSION: "r28c"
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
@@ -103,21 +102,11 @@ jobs:
           doNotCache: false
 
       - name: Install cargo tools
+        # FRB codegen 已移除：lib.rs 不再声明 mod bridge_generated（该生成物只是 Dart 侧胶水，
+        # 不参与 Rust 逻辑）。StreamSink/SyncReturn 类型仍由 flutter_rust_bridge crate 提供。
         run: |
           cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
           cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
-          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features uuid --locked
-
-      - name: Generate flutter_rust_bridge code
-        # lib.rs 中 mod bridge_generated 在 android/flutter feature 下无条件启用，必须生成。
-        # 只取 Rust 侧产物；Dart/C 产物落到占位目录，不参与编译，也不需要 Flutter SDK 或 pub get。
-        run: |
-          mkdir -p flutter/lib flutter/macos/Runner
-          ~/.cargo/bin/flutter_rust_bridge_codegen \
-            --rust-input ./src/flutter_ffi.rs \
-            --dart-output ./flutter/lib/generated_bridge.dart \
-            --c-output ./flutter/macos/Runner/bridge_generated.h
-          test -f src/bridge_generated.rs || { echo "bridge_generated.rs 未生成"; exit 1; }
 
       - name: Build vcpkg dependencies
         env:

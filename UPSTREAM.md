@@ -11,10 +11,7 @@
 ## 已删除（不参与 Android 控制端构建）
 
 ```
-flutter/            # Dart UI；仅保留下列占位
-  ├─ lib/.gitkeep           # FRB codegen --dart-output 目标
-  ├─ macos/Runner/.gitkeep  # FRB codegen --c-output 目标
-  └─ pubspec.yaml           # 占位，非上游原文件
+flutter/            # Dart UI，整目录删除（含 pubspec / lib / macos / android / ...）
 src/ui/             # Sciter 桌面 UI（lib.rs:26-31 已在 android/flutter feature 下 cfg 排除）
 appimage/ flatpak/ fastlane/ examples/ docs/
 .github/            # 上游 CI，替换为 build-core.yml
@@ -23,7 +20,7 @@ AGENTS.md CLAUDE.md GEMINI.md
 .gitmodules         # hbb_common 已 vendored，避免 checkout 覆盖
 ```
 
-## 保留（原样，未改动）
+## 保留（除 `src/lib.rs` 一行删除外，其余原样未改动）
 
 ```
 src/                # 含 lib.rs / flutter.rs / flutter_ffi.rs / hbbs_http/ 等核心
@@ -52,16 +49,38 @@ README.md            # 本仓库说明
 UPSTREAM.md          # 本文件
 NOTICE               # 版权与修改声明
 .github/workflows/build-core.yml
-flutter/{lib,macos/Runner}/.gitkeep + flutter/pubspec.yaml   # codegen 输出占位
 ```
+
+## 修改（唯一改动的上游文件）
+
+```
+src/lib.rs   删除 `#[cfg(...)] mod bridge_generated;`
+```
+
+`bridge_generated.rs` 是 FRB codegen 生成的 Dart 侧胶水，上游 `lib.rs:38` 声明它，
+但全仓库除该行外无任何引用，也不参与 Rust 逻辑。本仓库自研 JNI UI、不需要 Dart，
+故一并删掉 codegen 步骤、Flutter SDK 依赖与 `flutter/` 占位目录。
+`StreamSink` / `SyncReturn` 类型仍由 `flutter_rust_bridge` crate 提供，`flutter` feature 保留。
 
 ## 后续计划改动（尚未实施，P1 基线先验证纯裁剪可编）
 
-1. `src/android_jni.rs`（新增）：把 `flutter_ffi.rs` 的建连/认证/帧/输入/账号登录函数包成 `Java_com_termux_app_rustdesk_RustDeskCore_*` JNI 导出。**只做透传**，不含业务逻辑，不发起 HTTP。
-2. `src/flutter.rs`：`StreamSink<EventToUI>`（FRB 绑 Dart）改为 `UiSink` 枚举（`Frb`｜`Jni(GlobalRef)`），`push_event_` 等约 10 处 `stream.add(...)` 改为 `sink.emit(...)`；`JNI_OnLoad` 缓存 JavaVM，网络线程 `AttachCurrentThread` 后回调 Kotlin，退出时释放 `GlobalRef`。
-3. `Cargo.toml`：注册 `android_jni` 模块（并加 `#[cfg(target_os="android")]` gate）。
+采用 **JNI 旁路**方案，**不改任何 FRB 类型与导出签名**（早期设想的 `UiSink` 枚举会改动
+`session_start` / `start_global_event_stream` 的参数类型，触发 FRB codegen 解析，冲突面大，已弃用）：
 
-这三处是与上游逻辑产生分歧的地方，升级 tag 时优先处理冲突。
+1. `src/android_jni.rs`（新增，`#[cfg(target_os="android")]`）：把 `flutter_ffi.rs` 的建连/认证/
+   帧/输入/账号登录函数包成 `Java_com_termux_app_rustdesk_RustDeskCore_*` JNI 导出。
+   **只做透传**，不含业务逻辑，不发起 HTTP。
+2. `src/flutter.rs`：在既有事件出口旁**额外转发一份给 JNI**（`push_event_` 里 `out` 已是 JSON、
+   `Rgba` / `Cursor` / `Texture` 推送点、`push_global_event`），FRB 的 `stream.add(...)` 原样保留。
+   全部调用点用 `#[cfg(target_os="android")]` 包住，非 Android 平台零影响。
+3. `src/lib.rs`：注册 `android_jni` 模块。
+
+**JNI_OnLoad 不能重复定义**：`libs/scrap/src/android/ffi.rs:486` 已导出 `JNI_OnLoad` 并持有
+私有 `JVM` 静态。桥接层在 `nativeInit(ctx, callback)` 里用 `env.get_java_vm()` 自己缓存一份
+`JavaVM` + 回调对象的 `GlobalRef`；网络线程推事件时 `attach_current_thread()`，会话关闭时释放引用。
+`jni = "0.21"` 已在 `Cargo.toml` 的 `[target.'cfg(target_os = "android")'.dependencies]` 中，无需加依赖。
+
+这些是与上游逻辑产生分歧的地方，升级 tag 时优先处理冲突。
 
 ## 不变的身份代码（不要改）
 

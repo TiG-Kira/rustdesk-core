@@ -11,7 +11,7 @@ RustDesk Rust 核心的裁剪 fork，供 [Termux Ultra](https://github.com/TiG-K
 
 | 项 | 处理 |
 |---|---|
-| `flutter/`（Dart UI） | 删除，仅保留 FRB codegen 输出占位目录 |
+| `flutter/`（Dart UI） | 整目录删除，不留占位 |
 | `src/ui/`（Sciter 桌面 UI） | 删除（`lib.rs` 中该模块在 android/flutter feature 下已被 cfg 排除） |
 | 桌面打包材料（appimage/flatpak/fastlane/docs/...） | 删除 |
 | `libs/hbb_common` | 上游为 git submodule，此处 vendored 为普通目录，仓库自包含 |
@@ -31,7 +31,9 @@ libc++_shared.so
 
 按 ABI（`arm64-v8a` / `armeabi-v7a` / `x86_64`）分别出包，产物上传为 Actions artifact，供宿主落到 `app/src/main/jniLibs/<abi>/`。
 
-构建工具链版本必须与上游 `1.5.1` 保持一致（Rust 1.75 / NDK r28c / cargo-ndk 3.1.2 / flutter_rust_bridge_codegen 1.80.1 / vcpkg 9e593bb），改版本号前先核对上游 `.github/workflows/flutter-build.yml`。
+构建工具链版本必须与上游 `1.5.1` 保持一致（Rust 1.75 / NDK r28c / cargo-ndk 3.1.2 / vcpkg 9e593bb），改版本号前先核对上游 `.github/workflows/flutter-build.yml`。
+
+`flutter` feature 仍启用（`StreamSink` / `SyncReturn` 类型来自 `flutter_rust_bridge` crate），但 FRB 的 **codegen 生成物 `bridge_generated.rs` 不参与编译**——它只是 Dart 侧胶水，`lib.rs` 里已移除该模块声明，因此无需 Flutter SDK、`pub get` 或 codegen 步骤。
 
 ## 身份边界（硬约束）
 
